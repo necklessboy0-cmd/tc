@@ -6,14 +6,12 @@ from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
-from langchain.chains.combine_documents import create_stuff_documents_chain
-from langchain.chains import create_retrieval_chain
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import ChatPromptTemplate
 
 load_dotenv()
 
-# Get Gemini API key from Streamlit Secrets or .env
+# Get API key from Streamlit Secrets
 if "GOOGLE_API_KEY" in st.secrets:
     os.environ["GOOGLE_API_KEY"] = st.secrets["GOOGLE_API_KEY"]
 elif os.getenv("GOOGLE_API_KEY"):
@@ -27,25 +25,26 @@ st.set_page_config(
 )
 
 st.title("📚 Document Assistant")
-st.caption("Advanced RAG-powered document Q&A")
+st.caption("PDF Question Answering with RAG and Gemini")
 
 
 PDF_PATH = "terms_Recruitment_and_Trade_Policy_Manual.pdf"
 INDEX_PATH = "faiss_index"
 
 
-def process_documents(pdf_path):
-    """Load PDF, split it into chunks, create embeddings, and save FAISS index."""
+@st.cache_resource
+def create_vector_store(pdf_path):
+    """Load PDF, split text, create embeddings and FAISS index."""
 
     loader = PyPDFLoader(pdf_path)
     documents = loader.load()
 
-    text_splitter = RecursiveCharacterTextSplitter(
+    splitter = RecursiveCharacterTextSplitter(
         chunk_size=800,
         chunk_overlap=150
     )
 
-    chunks = text_splitter.split_documents(documents)
+    chunks = splitter.split_documents(documents)
 
     embeddings = HuggingFaceEmbeddings(
         model_name="all-MiniLM-L6-v2"
@@ -56,13 +55,17 @@ def process_documents(pdf_path):
         embeddings
     )
 
-    vector_store.save_local(INDEX_PATH)
-
     return vector_store
 
 
-def get_conversation_chain():
-    """Create the Gemini + FAISS RAG chain."""
+@st.cache_resource
+def get_embeddings():
+    return HuggingFaceEmbeddings(
+        model_name="all-MiniLM-L6-v2"
+    )
+
+
+def get_answer(vector_store, question):
 
     if not os.environ.get("GOOGLE_API_KEY"):
         st.error(
@@ -71,6 +74,18 @@ def get_conversation_chain():
         )
         st.stop()
 
+    # Retrieve the 3 most relevant document chunks
+    retriever = vector_store.as_retriever(
+        search_kwargs={"k": 3}
+    )
+
+    documents = retriever.invoke(question)
+
+    context = "\n\n".join(
+        document.page_content
+        for document in documents
+    )
+
     llm = ChatGoogleGenerativeAI(
         model="gemini-3.5-flash-lite",
         temperature=0.3
@@ -78,54 +93,44 @@ def get_conversation_chain():
 
     prompt = ChatPromptTemplate.from_template(
         """
-        Answer the question using only the information provided
-        in the document context.
+You are a document assistant.
 
-        If the answer cannot be found in the provided context,
-        clearly say that the document does not provide enough
-        information. Do not invent facts.
+Answer the user's question using ONLY the
+information contained in the context below.
 
-        Context:
-        {context}
+If the answer is not available in the context,
+say:
 
-        Question:
-        {input}
+"The document does not provide enough information
+to answer this question."
 
-        Answer:
-        """
+Do not invent or assume information.
+
+Context:
+{context}
+
+Question:
+{question}
+
+Answer:
+"""
     )
 
-    embeddings = HuggingFaceEmbeddings(
-        model_name="all-MiniLM-L6-v2"
+    messages = prompt.format_messages(
+        context=context,
+        question=question
     )
 
-    vector_store = FAISS.load_local(
-        INDEX_PATH,
-        embeddings,
-        allow_dangerous_deserialization=True
-    )
+    response = llm.invoke(messages)
 
-    retriever = vector_store.as_retriever(
-        search_kwargs={"k": 3}
-    )
-
-    document_chain = create_stuff_documents_chain(
-        llm,
-        prompt
-    )
-
-    retrieval_chain = create_retrieval_chain(
-        retriever,
-        document_chain
-    )
-
-    return retrieval_chain
+    return response.content
 
 
 def main():
 
-    # Check whether the PDF exists
+    # Check PDF
     if not os.path.exists(PDF_PATH):
+
         st.error(
             f"PDF file not found: {PDF_PATH}"
         )
@@ -137,42 +142,35 @@ def main():
 
         st.stop()
 
-    # Create FAISS index the first time the app runs
-    if not os.path.exists(INDEX_PATH):
+    # Create vector store
+    with st.spinner(
+        "Processing document and creating embeddings..."
+    ):
+        vector_store = create_vector_store(PDF_PATH)
 
-        with st.spinner(
-            "Processing PDF and generating embeddings..."
-        ):
-            process_documents(PDF_PATH)
+    st.success("Document is ready.")
 
-        st.success(
-            "Document processed successfully."
-        )
-
-    # Create RAG chain
-    rag_chain = get_conversation_chain()
-
-    # User question
-    user_question = st.text_input(
+    # Question input
+    question = st.text_input(
         "Ask a question about the document:"
     )
 
-    if user_question:
+    if question:
 
-        with st.spinner("Searching the document..."):
+        with st.spinner(
+            "Searching the document..."
+        ):
 
-            response = rag_chain.invoke(
-                {
-                    "input": user_question
-                }
+            answer = get_answer(
+                vector_store,
+                question
             )
 
         st.subheader("Answer")
 
-        st.write(
-            response["answer"]
-        )
+        st.write(answer)
 
 
 if __name__ == "__main__":
     main()
+    
